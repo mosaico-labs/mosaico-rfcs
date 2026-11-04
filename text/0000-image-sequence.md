@@ -3,14 +3,35 @@
 ## Summary
 
 Add an `ImageSequence` ontology and serialization format to Mosaico, to
-store the images of a camera, PNG or TIFF, each with the time it was
-captured. The client uploads the images as they are. Later, the store
-optimizer checks them and turns the whole sequence into an AV1 video, with
-a file that keeps the exact timestamps of every frame.
+store the images of a camera, each with the time it was captured. Only
+lossless image formats are considered for now: PNG and TIFF are the first
+ones supported.
+
+The client uploads the images as they are. Later, the store optimizer
+checks them and turns the whole sequence into an AV1 video, with a file
+that keeps the exact timestamps of every frame.
+
+The images are turned into a video because a video takes much less space
+in storage, as shown by the [file size graph][filesize] built from a
+sequence of 60 8K images (8192x4320) in the
+[image-sequence PoC][image-sequence-poc].
+
+That is why `mosaicod` does not keep the original images, only the video.
+However, the images are not deleted right away: a separate cleanup process
+deletes them after a retention period (24 hours by default), as it already
+does for the other files the store no longer uses.
+
+The video has one frame per image, so the topic can be read back in three
+ways:
+
+- as a whole video
+- as a series of independent videos that can be merged into a single one
+- as the image sequence, extracting one image from each frame
 
 > [!NOTE]
-> A first implementation saves image sequences and turns them into videos.
-> Reading back a topic that has become a video is not designed yet.
+> This RFC designs how image sequences are stored as Parquet files and
+> turned into videos. Reading back a topic that has become a video, in any
+> of the three ways above, is not designed yet.
 
 ## Motivation
 
@@ -23,6 +44,8 @@ has no dedicated way to store them:
   already compressed, so it does not get smaller at all. Yet consecutive
   images of a camera are often very close to each other, and a video codec
   can use this to take much less space.
+- There is no way to get the images of a camera back as a video, to watch
+  them or to give them to the tools that take videos.
 
 This affects every user who records cameras with Mosaico: the images are
 often the largest part of a recording, and so of its storage cost.
@@ -65,7 +88,7 @@ flowchart LR
    declared format is supported and the same for all the images, the bytes
    are really an image of that format, and the pixels can be decoded.
 3. **Encode.** If all the images are right, the optimizer decodes them,
-   converts them to 10-bit YUV 4:2:0 and encodes them into an **AV1 video**
+   converts them to YUV 4:2:0 and encodes them into an **AV1 video**
    in a Matroska file (`video.mkv`). The exact timestamps of the frames go
    into `timestamps.csv`. Both are written in a new folder of the store, and
    the topic is switched to that folder in a single database transaction.
@@ -116,6 +139,12 @@ with these fields:
 - `data` (`binary`): the encoded image, the content of a `.png` or `.tiff`
   file.
 
+Only **lossless** image formats are accepted, so that the images the
+server stores are exactly the ones the camera produced, and the encoding
+into a video is the only step that can lose information. PNG and TIFF are
+the first supported formats; other lossless formats can be added later.
+Lossy formats, such as JPEG, are not accepted.
+
 `format` and `capture_timestamp_ns` can be queried with the `.Q` proxy;
 `data` cannot.
 
@@ -157,9 +186,19 @@ tp_<id>/
     └── timestamps.csv     the exact timestamps of every frame
 ```
 
-The video is encoded with SVT-AV1, by default at preset 6 and CRF 18, one
-10-bit frame per image in capture order, each frame at its capture time in
-milliseconds. The file is tagged with the first capture time and the
+The video is encoded with SVT-AV1, by default at preset 5 and CRF 18, one
+frame per image in capture order, each frame at its capture time in
+milliseconds.
+
+The frames have the bit depth of the images, so that no bits are spent on
+precision the images do not have. PNG and TIFF images have 8 or 16 bits
+per sample, while AV1 (in its Main profile, the one SVT-AV1 encodes) has
+at most 10:
+
+- an 8-bit image becomes an 8-bit frame;
+- a 16-bit image becomes a 10-bit frame, and loses its 6 lowest bits.
+
+The file is tagged with the first capture time and the
 format, color type and bit depth of the source images. Matroska stores
 milliseconds, so `timestamps.csv` keeps the nanoseconds:
 
@@ -168,6 +207,24 @@ frame,timestamp_ns,capture_timestamp_ns,video_timestamp_ms
 0,1767225600000000000,1767225599990000000,0
 1,1767225600033366667,1767225600023366667,33
 ```
+
+### Reading back from the video
+
+The video is not only a way to take less space: it is what an optimized
+topic is read back from. Since the video has exactly one frame per image,
+in capture order, and `timestamps.csv` gives the times of every frame, a
+client can get:
+
+- **the whole video**, `video.mkv` with its `timestamps.csv`;
+- **a series of independent videos**, for example one per time range,
+  each of them playable on its own and all of them mergeable into a single
+  video;
+- **the image sequence**, decoding each frame into an image, with the
+  timestamps of `timestamps.csv`, so that the client gets back as many
+  images as it sent.
+
+How each of them is requested and produced is in the
+[open questions][reading-back].
 
 ### The `mosaicod` crates
 
@@ -227,8 +284,8 @@ What each crate does for image sequences:
 - `mosaicod-facade`: the operations on topics shared by the server and the
   tasks. Adds `rollback` to the write procedure of a topic, which removes
   the chunks written so far, so that a failed upload can be sent again.
-- `mosaicod-image` (new, pure Rust): the supported formats (`ImageFormat`:
-  PNG, TIFF), the quick check of the structure of an image (`is_image`,
+- `mosaicod-image` (new, pure Rust): the supported lossless formats
+  (`ImageFormat`: PNG, TIFF), the quick check of the structure of an image (`is_image`,
   `format_of`), the decoding into samples (`decode`), and the conversion to
   and from YUV 4:2:0 (`Image::to_yuv420`, `Yuv420::to_image`).
 - `mosaicod-video` (new): encodes YUV 4:2:0 frames into an AV1 video in a
@@ -266,14 +323,18 @@ FFmpeg 9 yet.
 
 - **Keep the images in Parquet.** This is what the serialization format
   does before the optimizer runs. It is simple and keeps the original
-  bytes, but every image is compressed on its own, and PNGs do not get
-  smaller.
+  bytes, but every image is compressed on its own, PNGs do not get
+  smaller, and a client that wants a video has to encode it itself.
 - **Check the images during the upload.** Decoding every image in `do_put`
   makes the upload too slow for long, high-resolution sequences. Only cheap
   checks could run there (see the open questions).
 - **Encode the video during the upload.** It has the same problem as
   checking the images, and the Matroska muxer needs to seek back in the
   file to complete it, which a stream cannot do.
+- **Accept lossy images, such as JPEG.** Each image has already lost
+  information, and encoding it into a video would lose more, on top of
+  the artifacts of the first compression. Only lossless formats are
+  accepted, so that the video is the only lossy step.
 - **A lossless video.** It keeps the images exactly, but takes much more
   space than CRF 18. It could be an option of a topic (see the open
   questions).
@@ -314,14 +375,13 @@ can only be answered while implementing, and can stay open.
 
 ### Reading the data back
 
-- **Question:** How does a client read a topic that has become a video?
-  Does the server decode the frames and send back PNG or TIFF images, or
-  does it send the `.mkv` and `timestamps.csv` and let the client decode
-  them?
-  - **Proposal:** the server decodes the frames and sends images of the
-    source format (the `SOURCE_*` tags of the video), so the client API
-    does not change. A separate call downloads the `.mkv` and
-    `timestamps.csv` for the clients that want the video.
+- **Question:** How does a client choose between the whole video, a
+  series of independent videos, and the image sequence?
+  - **Proposal:** reading the topic as usual returns the image sequence:
+    the server decodes the frames and sends images of the source format
+    (the `SOURCE_*` tags of the video), so the client API does not change.
+    A separate call returns the videos, the whole one or the ones of a
+    time range, with their `timestamps.csv`.
 - **Question:** If the server re-encodes the frames into images, the bytes
   will not match the ones the client sent. Is that acceptable, and how do
   we tell the client?
@@ -340,6 +400,12 @@ can only be answered while implementing, and can stay open.
     start decoding from the keyframe before them. If that is not enough,
     split long sequences into several videos, as Parquet topics are split
     into chunks.
+- **Question:** How are the independent videos made so that they can be
+  merged into a single video?
+  - **Proposal:** every video starts with a keyframe and is encoded with
+    the same settings (size, bit depth, preset, CRF), so that the videos
+    can be joined without encoding them again, and their `timestamps.csv`
+    files concatenated.
 
 ### Loss of information
 
@@ -352,6 +418,13 @@ can only be answered while implementing, and can stay open.
   Once the video is written, nothing can rebuild them exactly. Should the
   originals be kept somewhere, considering how much keeping both the images
   and the video costs?
+- **Question:** Why does the cleanup wait for a retention period before
+  deleting the files the store no longer uses, and is 24 hours right for
+  image sequences? Until it is over, a topic takes the space of both the
+  images and the video, and image sequences are often the largest part of
+  a recording.
+  - **Proposal:** write down why the cleanup waits, then decide whether
+    image sequences need a retention period of their own.
 - **Question:** 16-bit images become 10-bit frames. What about 16-bit
   grayscale images that are not pictures but measurements, such as depth
   maps? A lossy encoding changes their values.
@@ -392,9 +465,10 @@ can only be answered while implementing, and can stay open.
   resolution in the middle of a recording a real case for the users?
   - **Proposal:** if it is, start a new video each time the size changes.
 - **Question:** Transparent images, CMYK or floating point TIFFs, and other
-  formats (JPEG, raw Bayer) are not supported. Which of them do users need?
+  lossless formats (for example raw Bayer) are not supported. Which of them
+  do users need?
   - **Proposal:** keep them as Parquet with the `unsupported` issue, and add
-    a format when users ask for it.
+    a lossless format when users ask for it.
 
 ### Deployment
 
@@ -435,3 +509,6 @@ implementation, so they can stay open after this RFC is approved.
     as big as the largest video it encodes.
 
 [implementation]: #left-to-the-implementation
+[image-sequence-poc]: https://github.com/mosaico-labs/video-pocs/tree/main/image-sequence
+[filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/image-sequence/video-results/regular/batch_060/preset_5_crf_18/filesize-comparison/filesize-comparison.svg
+[reading-back]: #reading-the-data-back
