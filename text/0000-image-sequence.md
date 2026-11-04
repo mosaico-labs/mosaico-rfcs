@@ -11,31 +11,14 @@ The client uploads the images as they are. Later, the store optimizer
 checks them and turns the whole sequence into a lossless FFV1 video, with
 a file that keeps the exact timestamps of every frame.
 
-The images are turned into a video because a video can be read back in
-the ways described below, while FFV1 keeps every pixel of the images and
-still takes less space than them, as shown by the
-[file size graph][filesize] of the [ffv1-analysis PoC][ffv1-analysis]: a
-sequence of 60 8K images (8192x4320) takes 1,931 MiB as PNG and 1,279 MiB
-in FFV1, every pixel kept.
+The FFV1 video keeps every pixel of the images and takes less space than
+them, as shown by the [file size graph][filesize] of the
+[ffv1-analysis PoC][ffv1-analysis].
 
-Since the video holds exactly the pixels of the images, `mosaicod` does
-not keep the original images, only the video. However, the images are not
-deleted right away: a separate cleanup process deletes them after a
-retention period (24 hours by default), as it already does for the other
-files the store no longer uses.
-
-The video has one frame per image, so the topic can be read back in three
-ways:
-
-- as a whole video
-- as a series of independent videos that can be merged into a single one
-- as the image sequence, extracting from each frame exactly the image it
-  was made from
-
-> [!NOTE]
-> This RFC designs how image sequences are stored as Parquet files and
-> turned into videos. Reading back a topic that has become a video, in any
-> of the three ways above, is not designed yet.
+So `mosaicod` keeps only the video, not the original images. They are not
+deleted right away, though: a separate cleanup process deletes them after
+a retention period (24 hours by default), as it already does for the
+other files the store no longer uses.
 
 ## Motivation
 
@@ -52,10 +35,8 @@ handle as a whole:
   their topics into a video without losing information or getting the
   order of the frames wrong.
 - Stored as rows of Parquet files, the images are separate blobs: each
-  one is compressed on its own (a PNG, already compressed, does not get
-  any smaller), and a client can only get them back one by one.
-- There is no way to get the images of a camera back as a video, to watch
-  them or to give them to the tools that take videos.
+  one is compressed on its own, and a PNG, already compressed, does not
+  get any smaller.
 
 `ImageSequence` is that guarantee: every message is one self-contained
 image, all of a topic in the same lossless format, each with its capture
@@ -210,24 +191,6 @@ frame,timestamp_ns,capture_timestamp_ns,video_timestamp_ms
 1,1767225600033366667,1767225600023366667,33
 ```
 
-### Reading back from the video
-
-The video is not only a way to store the images: it is what an optimized
-topic is read back from. Since the video has exactly one frame per image,
-in capture order, and `timestamps.csv` gives the times of every frame, a
-client can get:
-
-- **the whole video**, `video.mkv` with its `timestamps.csv`;
-- **a series of independent videos**, for example one per time range,
-  each of them playable on its own and all of them mergeable into a single
-  video;
-- **the image sequence**, decoding each frame into exactly the pixels of
-  its image, with the timestamps of `timestamps.csv`, so that the client
-  gets back as many images as it sent.
-
-How each of them is requested and produced is in the
-[open questions][reading-back].
-
 ### The `mosaicod` crates
 
 Two crates are new, `mosaicod-image` and `mosaicod-video`. The others
@@ -319,8 +282,9 @@ image, so that its libraries depend on nothing but the C library.
 - **Encoding takes resources.** It takes CPU time, mostly to decode the
   images, and local disk space on the machine of the optimizer, one topic
   at a time.
-- **Reading back is not designed yet.** Until it is, a topic that has
-  become a video cannot be downloaded by a client.
+- **Reading back is not designed yet.** It is the subject of a separate
+  RFC: until it is implemented, a topic that has become a video cannot be
+  downloaded by a client.
 
 ## Alternatives
 
@@ -371,84 +335,6 @@ can only be answered while implementing, and can stay open.
   - **Proposal:** keep it separate, so that encoding does not take the CPU
     of the server and can run on other machines. The deployment starts it
     as a long-lived process next to the server.
-- **Question:** Even when started right away, encoding a long sequence
-  takes time, so a topic is still Parquet for a while. What does a client
-  get when it reads the topic in the meantime?
-  - **Proposal:** reading back works the same in both states: the images as
-    sent before the optimization, the decoded video after. The server also
-    exposes the optimization state of a topic (pending, optimized, or its
-    issue), so that a client that wants the video file itself can wait for
-    it.
-
-### Reading the data back
-
-- **Question:** How does a client choose between the whole video, a
-  series of independent videos, and the image sequence?
-  - **Proposal:** reading the topic as usual returns the image sequence:
-    the server decodes the frames and sends images of the source format
-    (written in the tags of the video), so the client API does not change.
-    A separate call returns the videos, the whole one or the ones of a
-    time range, with their `timestamps.csv`.
-- **Question:** If the server encodes the frames back into images, they
-  have the same pixels as the ones the client sent, but not the same
-  bytes: the compression and the metadata of the files may differ. Is
-  that acceptable, and how do we tell the client?
-  - **Proposal:** document it in the `ImageSequence` ontology, and use the
-    optimization state of the topic to tell whether the images are the
-    original files or encoded again from the video.
-- **Question:** The video is in capture order, while the topic is indexed
-  by `timestamp_ns`. When the two orders differ, in which order are the
-  images read back?
-  - **Proposal:** in `timestamp_ns` order, like every other topic, using
-    `timestamps.csv` to find the frame of each row.
-- **Question:** A long recording becomes a single video. How is a time
-  range read without reading the whole file?
-  - **Proposal:** every FFV1 frame can be decoded on its own, so find the
-    frames of the range in `timestamps.csv` and read only them, through
-    the index of the frames that Matroska keeps. If that is not enough,
-    split long sequences into segments (see [MPEG-DASH][mpeg-dash]).
-- **Question:** How are the independent videos made so that they can be
-  merged into a single video?
-  - **Proposal:** every FFV1 frame stands on its own, so any run of frames
-    is a video of its own. Videos of the same size, channels and bit depth
-    can be joined without encoding them again, and their `timestamps.csv`
-    files concatenated.
-
-### MPEG-DASH
-
-MPEG-DASH is a standard way to split a video into segments, listed with
-their times in a manifest, so that a client fetches only the segments it
-needs. Here it would be used only to get segments and read the data back,
-not to play the video in a browser.
-
-A first test, with FFmpeg 9.0.2 on the FFV1 video of 8K RGBA images:
-FFmpeg's DASH muxer writes a manifest and segments in fragmented MP4, and
-the frames read back from the segments are byte for byte the ones of the
-original PNGs. WebM segments, the other kind DASH uses, cannot hold FFV1.
-
-- **Question:** Should an image sequence be stored as DASH segments, with
-  their manifest, instead of a single `video.mkv`?
-  - **Proposal:** yes, if reading time ranges from a single file is not
-    enough: the optimizer writes the segments and the manifest, so that a
-    read needs no repackaging, and the whole video is the segments joined.
-- **Question:** How long should a segment be? Short segments let a client
-  fetch only what it needs, but mean more files and more requests to the
-  store.
-  - **Proposal:** cut the segments by size, close to the size of the
-    Parquet chunks (`--max-chunk-size`), since every frame can start a
-    segment. Measure it on real recordings.
-- **Question:** FFV1 in MP4 is FFmpeg's own mapping: FFV1 is not a codec
-  registered for MP4, and the manifest has no codec string for it. Only
-  readers built on FFmpeg can read the segments. Is that acceptable?
-  - **Proposal:** yes: `mosaicod` reads them with FFmpeg, and the Python
-    SDK can with PyAV, which it already depends on.
-- **Question:** Can the segments keep the exact timestamps, so that
-  `timestamps.csv` is no longer needed? MP4 can count time in nanoseconds,
-  but stores the duration of each frame in 32 bits: at that precision, two
-  frames cannot be more than about 4.3 seconds apart.
-  - **Proposal:** keep `timestamps.csv`, which also holds the time each
-    image was recorded, and use the times of the segments only to find
-    them.
 
 ### Loss of information
 
@@ -544,5 +430,3 @@ implementation, so they can stay open after this RFC is approved.
 [ffv1-analysis]: https://github.com/mosaico-labs/video-pocs/tree/main/ffv1-analysis
 [filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/ffv1-analysis/results/reference/ffv1/filesize-input.svg
 [av1-filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/image-sequence/video-results/regular/batch_060/preset_5_crf_18/filesize-comparison/filesize-comparison.svg
-[reading-back]: #reading-the-data-back
-[mpeg-dash]: #mpeg-dash
