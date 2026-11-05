@@ -2,66 +2,88 @@
 
 ## Summary
 
-Add an `ImageSequence` ontology and serialization format to Mosaico, to
-store the images of a camera, each with the time it was captured. Only
-lossless image formats are considered for now: PNG and TIFF are the first
-ones supported.
+Add two ontologies to Mosaico, with a serialization format each, to store
+the images of a camera, each with the time it was captured:
+
+- `ImageSequence`: PNG images, compressed losslessly.
+- `ImageSequenceRaw`: raw images, as a camera driver writes them, for
+  example a ROS `sensor_msgs/Image`.
+
+They replace the `Image` ontology, which is deprecated. `CompressedImage`,
+for lossy images and video streams, does not change.
 
 The client uploads the images as they are. Later, the store optimizer
-checks them and turns the whole sequence into a lossless FFV1 video, with
-a file that keeps the exact timestamps of every frame.
+checks them and turns the whole sequence into a lossless FFV1 video, with a
+frame index that keeps every other column of the images: their exact
+timestamps, their ROS fields, the layout of raw images.
 
 The FFV1 video keeps every pixel of the images and takes less space than
 them, as shown by the [file size graph][filesize] of the
 [ffv1-analysis PoC][ffv1-analysis].
 
 So `mosaicod` keeps only the video, not the original images. They are not
-deleted right away, though: a separate cleanup process deletes them after
-a retention period (24 hours by default), as it already does for the
-other files the store no longer uses.
+deleted right away, though: a separate cleanup process deletes them after a
+retention period (24 hours by default), as it already does for the other
+files the store no longer uses.
+
+A client reads back the images as they were uploaded (raw images byte for
+byte, PNGs pixel for pixel), or the video itself, as MPEG-DASH segments of
+one second.
 
 ## Motivation
 
-Robots and vehicles record long sequences of camera images. Mosaico can
-already store them, with the `Image` and `CompressedImage` ontologies:
-both carry the time the image was recorded (the timestamp of the message)
-and, optionally, the time the camera took it (in their header). But
-nothing tells the server that a topic is a sequence of images it can
-handle as a whole:
+Robots and vehicles record long sequences of camera images, and the images
+are often the largest part of a recording, and so of its storage cost.
 
-- `Image` and `CompressedImage` accept raw buffers, lossy formats such as
-  JPEG, and video streams such as H.264 that depend on the previous
-  frames, and the capture time is optional. So the server cannot turn
-  their topics into a video without losing information or getting the
-  order of the frames wrong.
-- Stored as rows of Parquet files, the images are separate blobs: each
-  one is compressed on its own, and a PNG, already compressed, does not
-  get any smaller.
+The `Image` ontology was created to pack the image sequences of ROS bags.
+But it does not tell the server that a topic is a sequence it can handle as
+a whole:
 
-`ImageSequence` is that guarantee: every message is one self-contained
-image, all of a topic in the same lossless format, each with its capture
-time. With it, the server can check the images and turn the whole topic
-into one video that keeps them exactly.
+- **One ontology for different things.** Each message can be raw pixels or
+  a PNG, chosen by a field of the message. The server cannot know how to
+  read a topic without looking at every image.
+- **No capture time.** The time the camera took the image is in an
+  optional header. Without it, the server cannot order the frames of a
+  video.
+- **Separate blobs.** Stored as rows of Parquet files, each image is
+  compressed on its own: a PNG does not get any smaller, and raw pixels
+  only a little.
 
-This affects every user who records cameras with Mosaico: the images are
-often the largest part of a recording, and so of its storage cost.
+We wanted a guarantee per topic: every message is one self-contained
+image, all of a topic of the same kind, each with its capture time. With
+it, the server can check the images and turn the whole topic into one video
+that keeps them exactly.
+
+So `Image` is split into two ontologies, one per kind of image:
+
+- `ImageSequence` for PNGs, which a client already has compressed.
+- `ImageSequenceRaw` for raw images, the largest data of all, which the
+  video compresses the most. It keeps everything a ROS `sensor_msgs/Image`
+  has, so that a ROS bag can be read back exactly.
+
+Each ontology has only the fields its images need, all required but the
+optional ones taken from the ROS header. The capture time is a field of its
+own, required, instead of being in a header.
+
+This affects every user who records cameras with Mosaico, and in
+particular those who record ROS bags.
 
 ## Design
 
 ### The data flow, from client to server
 
 An image sequence goes through four phases. Only the first one involves the
-client and the server (`mosaicod server`). The others run later, in two
+client and the server, `mosaicod server`. The others run later, in two
 separate processes started with the same binary: `mosaicod store-optimizer`
 and `mosaicod cleanup`.
 
 ```mermaid
 flowchart TD
     U["1. Upload<br/>the client sends the images,<br/>mosaicod server writes them as Parquet"]
-    C["2. Check<br/>the store optimizer<br/>checks every image"]
+    C["2. Check<br/>the store optimizer<br/>checks the PNGs"]
     E["3. Encode<br/>the store optimizer<br/>writes the FFV1 video"]
     D["4. Cleanup<br/>the cleanup process deletes<br/>the old Parquet files"]
-    I["Issue recorded on the topic,<br/>which keeps its Parquet files"]
+    I["Issue notified on the topic,<br/>which keeps its Parquet files"]
     U --> C
     C -->|"every image is valid"| E
     C -->|"an image is not valid"| I
@@ -69,132 +91,202 @@ flowchart TD
     E -->|"the images cannot become a video"| I
 ```
 
-1. **Upload.** The client creates a topic with the `ImageSequence` ontology
-   and pushes one message per image. `mosaicod` writes the batches into
-   Parquet files (the *chunks* of the topic) as they arrive, **without
-   checking the images**: decoding them would make the upload too slow.
-2. **Check.** Later, the **store optimizer** (`mosaicod store-optimizer`)
-   takes the complete topics that are not optimized yet. A topic is queued
-   as soon as its upload is finalized, but it is optimized only when the
-   optimizer runs: by default it runs once and exits,
-   so it must be started by hand or by a scheduler; with a positive
-   `--time-interval` it runs in a loop, sleeping that many seconds between
-   runs. Several optimizers can run at the same time: each topic is leased
-   by one of them. For an image sequence it checks every image: the
-   declared format is supported and the same for all the images, the bytes
-   are really an image of that format, and the pixels can be decoded.
-3. **Encode.** If all the images are right, the optimizer decodes them
-   and encodes them into a lossless **FFV1 video** in a Matroska file
-   (`video.mkv`). The exact timestamps of the frames go into
-   `timestamps.csv`. Both are written in a new folder of the store, and
-   the topic is switched to that folder in a single database transaction.
-4. **Cleanup.** The old folder with the Parquet chunks is no longer
-   referenced. The **cleanup** (`mosaicod cleanup`) marks it and, on a run
-   after the retention period (`--retention-duration`, 24 hours by
-   default), deletes it. Like the optimizer, by default it runs once and
-   exits, or in a loop with a positive `--time-interval`.
+1. **Upload.** The client creates a topic with one of the two ontologies
+   and pushes one message per image. `mosaicod server` writes them into
+   Parquet files, **without checking the images**: decoding them would
+   make the upload too slow.
+2. **Check.** Later, the **store optimizer** takes the complete topics that
+   are not optimized yet. By default it runs once and exits, or it runs in
+   a loop. Several optimizers can run at the same time: each topic is
+   leased by one of them. For PNGs, it checks every image without decoding
+   it: its format is declared, supported and the same for all the images,
+   and its bytes are really a PNG. Raw images have nothing to check without
+   decoding them.
+3. **Encode.** The optimizer decodes the images, once, and encodes them
+   into a lossless **FFV1 video**. The video and its frame index are
+   written in a new folder of the store, and the topic is switched to that
+   folder in a single database transaction.
+4. **Cleanup.** The old folder with the Parquet files is no longer
+   referenced. The **cleanup** marks it and deletes it after the retention
+   period. Like the optimizer, it runs once or in a loop.
 
-When a phase finds a problem, the topic is **left as the client sent it**,
-and the problem is recorded on the topic in the database, as one of these
-issues with a message:
+### The ontologies
 
-- `format_mismatch`: a format is missing, unsupported, different from the
-  first image's, or does not match the bytes. Found in phase 2.
-- `undecodable`: the bytes are not an image, or the pixels are corrupted.
-  Found in phase 2.
-- `unsupported`: the images are right but cannot become a video without
-  losing information (different sizes, channels or bit depths, extra
-  columns, a layout that cannot be decoded, no images). Found in phase 3.
-- `failed`: something outside the data failed (encoder, store, network,
-  database). The topic is tried again at the next run of the optimizer.
+Each message of both ontologies is one image. As in every ontology, the
+message wrapping it has `timestamp_ns`: when the image was **recorded**.
 
-The first three depend on the data, so the topic is never tried again until
-someone clears the issue.
+`ImageSequence`, PNG images:
 
-### The ontology
-
-The ontology and the serialization format have the same name,
-`ImageSequence`, but they are different things:
-
-- the **ontology** is the shape of each message, what the client sends
-- the **serialization format** is how the server writes the messages on
-  disk
-
-Each message of the ontology is one image, with these fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `timestamp_ns` | `int64` | When the image was **recorded**, in nanoseconds since the Unix epoch. As in every ontology, it comes from the message wrapping the image. |
-| `capture_timestamp_ns` | `int64` | When the camera **took** the image, in nanoseconds since the Unix epoch. Queries can filter on it. |
-| `format` | `string` | The encoding of the image, `png` or `tiff`. It is the same for all the images of a topic. Queries can filter on it. |
-| `data` | `binary` | The encoded image, the content of a `.png` or `.tiff` file. Queries cannot filter on it. |
-
-Only **lossless** image formats are accepted, so that the server stores
-exactly the images the camera produced, from the upload to the video. PNG
-and TIFF are the first supported formats, other lossless formats can be
-added later. Lossy formats, such as JPEG, are not accepted.
-
-### The serialization format
-
-`ImageSequence` is a new serialization format. On disk it is Parquet, like
-the other formats: what changes are the settings of each column.
-
-| Column | Compression | Statistics | Why |
+| Field | Type | Null | Description |
 |---|---|---|---|
-| `timestamp_ns` | none | page statistics and a bloom filter | To find quickly the images of a time range. |
-| `capture_timestamp_ns` | ZSTD level 5 | page statistics | To filter by capture time. |
-| `format` | dictionary encoding, then ZSTD level 5 | page statistics | The value is the same in every row, so it takes almost no space. |
-| `data` | ZSTD level 3 | none | Uncompressed TIFFs get smaller; PNGs are already compressed and stay about the same size. |
-| any other column | none | none | |
+| `format` | `string` | no | The encoding of the image: only `png`. |
+| `capture_timestamp_ns` | `int64` | no | When the camera **took** the image, in nanoseconds since the Unix epoch. |
+| `frame_id` | `string` | yes | The coordinate frame of the camera, from the ROS header. |
+| `sample_counter` | `uint64` | yes | The number of the image, from the ROS 1 header (`seq`). |
+| `data` | `binary` | no | The PNG. |
 
-The columns are found by their names, so the fields of the ontology must
+`ImageSequenceRaw`, raw images:
+
+| Field | Type | Null | Description |
+|---|---|---|---|
+| `capture_timestamp_ns` | `int64` | no | When the camera **took** the image, in nanoseconds since the Unix epoch. |
+| `width` | `uint32` | no | Pixels per row. |
+| `height` | `uint32` | no | Rows. |
+| `stride` | `uint32` | no | Bytes per row, padding included. |
+| `encoding` | `string` | no | The pixel encoding, as in ROS: `mono8`, `bgr8`, `16UC1`... |
+| `is_bigendian` | `bool` | yes | Whether the 16-bit samples are big-endian. Little-endian if null. |
+| `frame_id` | `string` | yes | The coordinate frame of the camera, from the ROS header. |
+| `sample_counter` | `uint64` | yes | The number of the image, from the ROS 1 header (`seq`). |
+| `data` | `binary` | no | The pixels, `stride × height` bytes. |
+
+Every field but `data` can be filtered in queries.
+
+Only **lossless** images are accepted, so that the server stores exactly
+the images the camera produced. Lossy images, such as JPEG, stay in
+`CompressedImage`.
+
+### ROS images
+
+The ROS bridge turns a `sensor_msgs/Image` into an `ImageSequenceRaw`, and
+back into the same message:
+
+| ROS | `ImageSequenceRaw` |
+|---|---|
+| `header.stamp` | `capture_timestamp_ns` |
+| `header.frame_id` | `frame_id`, null if empty |
+| `header.seq` (ROS 1 only) | `sample_counter` |
+| `width`, `height`, `step` | `width`, `height`, `stride` |
+| `encoding`, `is_bigendian` | `encoding`, `is_bigendian` |
+| `data` | `data` |
+
+An image whose stamp is zero has no capture time, and is not translated
+(see the open questions).
+
+### `Image` is deprecated
+
+`Image` topics can still be written and read. Creating one for writing
+warns the user to use `ImageSequenceRaw` instead. The `Image` topics
+already stored are still exported to ROS.
+
+### The serialization formats
+
+`ImageSequence` and `ImageSequenceRaw` are two new serialization formats.
+On disk they are Parquet, like the other formats: what changes are the
+settings of each column.
+
+| Column | Compression | Statistics |
+|---|---|---|
+| `timestamp_ns` | none | page statistics and a bloom filter |
+| `capture_timestamp_ns` | ZSTD | page statistics |
+| `format`, `frame_id`, and for raw images `width`, `height`, `stride`, `encoding`, `is_bigendian` | dictionary, then ZSTD | page statistics |
+| `data` of a PNG | none: it is compressed already | none |
+| `data` of a raw image | ZSTD, fast | none |
+| any other column | none | none |
+
+The columns are found by their names, so the fields of the ontologies must
 not be renamed.
+
+### The issues
+
+When the optimizer finds a problem, the topic is **left as the client sent
+it**, and readable. The problem is written in an `error` notification on
+the topic, `store optimizer/<issue>: <details>`, with one of these issues:
+
+- `format_mismatch`: a PNG has no format, an unsupported one, or one
+  different from the other images.
+- `undecodable`: a PNG is not valid or its pixels are corrupted, or the
+  bytes of a raw image do not match its size and stride.
+- `unsupported`: the images cannot become a video without losing
+  information. For example, images of different sizes, a required field
+  missing, or a raw encoding the video cannot hold yet.
+- `failed`: something outside the data failed: the encoder, the store, the
+  network, the database.
+
+The first three depend on the data: the optimization of the topic ends,
+and it is never tried again. A `failed` topic is tried again at the next
+run, with a notification at every attempt.
 
 ### The video
 
-After the store optimizer, the topic is no longer Parquet:
+After the optimizer, the topic is no longer Parquet. Its folder has the
+video, `video.mp4`, and its frame index, `timestamps.parquet`.
 
-```txt
-tp_<id>/
-├── metadata.json          copied from the old folder
-└── data/
-    ├── video.mkv          the images, FFV1 in a Matroska file
-    └── timestamps.csv     the exact timestamps of every frame
-```
+The video is encoded with FFV1, FFmpeg's lossless video codec, in a
+fragmented MP4 file: a header, then one fragment per image, in capture
+order. Every frame is a keyframe, so any fragment can be decoded without
+the others. Each frame is at its capture time, in microseconds from the
+first one.
 
-The video is encoded with FFV1, FFmpeg's lossless video codec, in its
-version 3, which checks each part (*slice*) of a frame with a CRC: a frame
-is split into 16 slices, encoded and decoded in parallel. There is one
-frame per image, in capture order, each at its capture time in
-milliseconds.
+The frames keep exactly the pixels of the images, with no color
+conversion: gray, gray with alpha, RGB or RGBA, of 8 or 16 bits.
 
-FFV1 compresses every frame on its own, so any frame can be decoded
-without the others, and it is **lossless**: every frame decodes back to
-exactly the pixels of its image. The pixels are stored as the image holds
-them, with no color conversion, so the channels, the alpha channel
-included, and the bit depth are kept:
+Raw images can become a video in these encodings:
 
-| Image | Frame |
+| Encoding | Frame |
 |---|---|
-| gray, 8 or 16 bits | gray, 8 or 16 bits |
-| gray with alpha, 8 or 16 bits | gray and alpha, 8 or 16 bits |
-| RGB, 8 or 16 bits | RGB, 8 or 16 bits |
-| RGBA, 8 or 16 bits | RGBA, 8 or 16 bits |
+| `mono8`, `8UC1`, the Bayer ones of 8 bits | gray, 8 bits |
+| `mono16`, `16UC1`, `16SC1`, the Bayer ones of 16 bits | gray, 16 bits |
+| `rgb8`, `bgr8`, `8UC3`, `rgba8`, `bgra8`, `8UC4` | RGB or RGBA, 8 bits |
+| `rgb16`, `bgr16`, `16UC3`, `rgba16`, `bgra16`, `16UC4` | RGB or RGBA, 16 bits |
 
-The file is tagged with the first capture time and the format, color type
-and bit depth of the source images. Matroska stores milliseconds, so
-`timestamps.csv` keeps the nanoseconds:
+BGR pixels are swapped into RGB, and back when they are read. Big-endian
+samples are read in their byte order, and written back in it. The padding
+of the rows must be zero, and is written back as zero.
 
-```csv
-frame,timestamp_ns,capture_timestamp_ns,video_timestamp_ms
-0,1767225600000000000,1767225599990000000,0
-1,1767225600033366667,1767225600023366667,33
-```
+The **frame index** is a Parquet file with one row per frame: where its
+fragment is in the video, its time in the video, and every column of its
+image but `data`, as uploaded. It also keeps the schema the images were
+uploaded with. An image is read back as its row, with its frame decoded as
+its `data`.
+
+### Reading back
+
+The client chooses what to read of an image sequence topic:
+
+- **The images**, the default. They come back with the schema they were
+  uploaded with, sorted by `timestamp_ns`. A time range keeps those whose
+  `timestamp_ns` is in it, as for any topic. Once the topic is a video, raw
+  images come back byte for byte, and PNGs pixel for pixel: the server
+  encodes them again, so their bytes can differ.
+- **The video**, as MPEG-DASH: a manifest, an initialization segment, and
+  one media segment per second of video. Every segment starts with a
+  keyframe. With no interval, every segment comes back: together with the
+  initialization segment, they are the whole video.
+
+An interval asks for the seconds `[start, end)` of the video, second 0
+starting at its first frame. It is wrong when it does not start before its
+end, when it ends after the video, or when it comes with a time range: then
+the request fails. A second with no frames, in a pause of the capture, has
+no segment.
+
+The segments are read from the store as byte ranges of the video, without
+FFmpeg. Each comes with the exact timestamps of its frames. Before the
+topic is a video, asking for the video fails.
+
+FFV1 has no registered codec name in MP4 and DASH. FFmpeg and the tools
+built on it read the segments, but browsers and most DASH players do not.
+
+### Deployment
+
+FFmpeg is needed only to encode the videos and to decode them back into
+images. So `mosaicod` is built in two ways:
+
+- **Without video support**, the default: it needs no FFmpeg. The server
+  reads back the images of the topics not yet a video, and the video
+  itself. The store optimizer optimizes every other topic, and leaves the
+  image sequences in the queue for one that can.
+- **With video support**: FFmpeg is linked inside `mosaicod`, so it needs
+  nothing else to run. This is the `mosaicod-optimizer` Docker image.
+
+So the store optimizer can run on a machine with FFmpeg, and the server on
+another. When it starts, the optimizer checks that its FFmpeg has the FFV1
+codec and the MP4 format. If not, it logs an error and leaves the image
+sequences in the queue.
 
 ### The `mosaicod` crates
 
 Two crates are new, `mosaicod-image` and `mosaicod-video`. The others
-already exist and are extended. An arrow `A --> B` means "A uses B"; only
+already exist and are extended. An arrow `A --> B` means "A uses B". Only
 the crates involved with image sequences are shown.
 
 ```mermaid
@@ -208,16 +300,18 @@ flowchart TD
     CORE["mosaicod-core"]
     IMAGE["mosaicod-image (new)"]
     VIDEO["mosaicod-video (new)"]
-    FFMPEG[("FFmpeg<br/>FFV1 + Matroska")]
+    FFMPEG[("FFmpeg<br/>FFV1 + MP4")]
 
     FLIGHT --> FACADE
     FLIGHT --> RW
+    FLIGHT -.->|"video support"| IMAGE
+    FLIGHT -.->|"video support"| VIDEO
     TASK --> FACADE
     TASK --> RW
     TASK --> STORE
     TASK --> DB
-    TASK --> IMAGE
-    TASK --> VIDEO
+    TASK -.->|"video support"| IMAGE
+    TASK -.->|"video support"| VIDEO
     VIDEO --> IMAGE
     VIDEO --> FFMPEG
     FACADE --> RW
@@ -230,40 +324,30 @@ flowchart TD
 
 What each crate does for image sequences:
 
-- `mosaicod-core`: the shared types. Adds `Format::ImageSequence` and
-  `OptimizationIssue` (`format_mismatch`, `undecodable`, `unsupported`,
-  `failed`).
-- `mosaicod-marshal`: maps the `FORMAT_IMAGE_SEQUENCE` value of the protocol
-  to `Format::ImageSequence`.
-- `mosaicod-rw`: reads and writes the Parquet chunks. Adds the column
-  settings of the `ImageSequence` serialization format.
-- `mosaicod-grpc-flight`: the `do_put` endpoint of the upload. It uses only
-  `mosaicod-rw`, so it never looks inside the images.
-- `mosaicod-db`: the PostgreSQL queries. Adds the `optimization_issue` and
-  `optimization_issue_message` columns of `topic_t`, and the queries that
-  record and clear them.
-- `mosaicod-store`: the filesystem or S3 store. Adds
-  `Store::write_from_file`, which uploads a local file in parts of 16 MiB
-  (an S3 multipart upload), so the video is never held whole in memory.
-- `mosaicod-image` (new, pure Rust): the supported lossless formats
-  (`ImageFormat`: PNG, TIFF), the quick check of the structure of an image
-  (`is_image`, `format_of`), and the decoding into samples (`decode`).
-- `mosaicod-video` (new): encodes images into an FFV1 video in a Matroska
-  file and decodes it back into the same images, with FFmpeg. The encoder
-  and decoder are behind the `ffmpeg` feature, so the crate builds without
-  FFmpeg when they are not needed.
-- `mosaicod-task`: the background tasks. The store optimizer is split into
-  steps shared by every topic (read, copy the metadata, complete the
-  optimization), and gets an image sequence path
-  (`store_optimizer/image_sequence.rs`) that checks, encodes, writes and
-  switches the topic. It is the only crate that uses `mosaicod-image` and
-  `mosaicod-video`.
+- `mosaicod-core`: the two new formats and the issues.
+- `mosaicod-marshal`: maps the formats and the reading options of the
+  protocol.
+- `mosaicod-rw`: the column settings of the two formats, and the layout of
+  the video and of its frame index, which the server and the optimizer
+  share.
+- `mosaicod-store`: writes a local file to the store in parts, and reads
+  byte ranges of a file.
+- `mosaicod-db`: the queue of the optimizer, which can skip the image
+  sequences, and the notification of the issues.
+- `mosaicod-facade`: finds the video of a topic.
+- `mosaicod-image` (new, pure Rust): checks and decodes PNGs, and turns raw
+  images into samples and back into the same bytes.
+- `mosaicod-video` (new): encodes images into an FFV1 video and decodes it
+  back, with FFmpeg, and finds the fragments of a video without it.
+- `mosaicod-task`: the store optimizer gets an image sequence path that
+  checks, encodes, writes and switches the topic.
+- `mosaicod-grpc-flight`: reads back the images, from the Parquet files or
+  from the video, and the video as MPEG-DASH segments.
 
-Because `mosaicod-task` enables the `ffmpeg` feature, building `mosaicod`
-needs FFmpeg with its FFV1 encoder and decoder and its Matroska muxer and
-demuxer, which are part of FFmpeg itself: no other library is needed.
-`scripts/install-ffmpeg` builds FFmpeg 9 with only those for the Docker
-image, so that its libraries depend on nothing but the C library.
+### The Python SDK
+
+The SDK adds the two ontologies and their serialization formats,
+deprecates `Image`, and translates ROS images into `ImageSequenceRaw`.
 
 ## Drawbacks
 
@@ -271,44 +355,50 @@ image, so that its libraries depend on nothing but the C library.
   so the 60 8K images of the PoC take 1,279 MiB, 1.5 times less than as
   PNG, while a lossy AV1 video of them takes about 12 MiB (see the
   alternatives).
-- **The original files are not kept.** The video keeps the pixels of the
-  images, but not the files the client sent: once the retention period is
-  over, what was in a PNG or TIFF file besides its pixels (its compression,
-  its metadata) is lost.
+- **PNG files are not kept.** The video keeps their pixels, but once the
+  retention period is over, the rest of the file (its compression, its
+  metadata) is lost. Raw images, instead, come back byte for byte.
 - **Bad images are found late.** The upload accepts any bytes, and the
   client learns about a bad image only after the optimizer has run.
-- **A new system dependency.** Building and running `mosaicod` needs
-  FFmpeg, built from source for the Docker image.
+- **A new dependency, for the optimizer.** Encoding needs FFmpeg, built
+  from source for the `mosaicod-optimizer` image.
 - **Encoding takes resources.** It takes CPU time, mostly to decode the
   images, and local disk space on the machine of the optimizer, one topic
   at a time.
-- **Reading back is not designed yet.** It is the subject of a separate
-  RFC: until it is implemented, a topic that has become a video cannot be
-  downloaded by a client.
+- **Few players read the video.** FFV1 in MP4 and DASH is read by FFmpeg
+  and the tools built on it, not by browsers.
+- **Some ROS images are refused.** A ROS image whose stamp is zero cannot
+  be translated, and its topic cannot be ingested.
 
 ## Alternatives
 
-- **Keep the images in Parquet.** This is what the serialization format
-  does before the optimizer runs. It is simple and keeps the original
-  bytes, but every image is compressed on its own, PNGs do not get
-  smaller, and a client that wants a video has to encode it itself.
-- **Check the images during the upload.** Decoding every image while it
-  is uploaded makes the upload too slow for long, high-resolution
-  sequences. Only cheap checks could run there (see the open questions).
-- **Encode the video during the upload.** It has the same problem as
-  checking the images, and the Matroska muxer needs to seek back in the
-  file to complete it, which a stream cannot do.
+- **Keep `Image`.** It mixes raw and PNG images in one ontology, and its
+  capture time is optional: the server cannot turn its topics into a video
+  without checking every image, nor order their frames.
+- **One ontology for PNG and raw images.** The layout fields of raw images
+  would be null for every PNG, and the server would need to look at each
+  image to know how to read it.
+- **Keep the ROS header as it is.** Its stamp would repeat the capture
+  time, and a struct would carry only two optional fields.
+- **Keep the images in Parquet.** This is what the formats do before the
+  optimizer runs. It is simple and keeps the original bytes, but every
+  image is compressed on its own, PNGs do not get smaller, and a client
+  that wants a video has to encode it itself.
+- **Check the images during the upload.** Decoding every image while it is
+  uploaded makes the upload too slow for long, high-resolution sequences.
 - **Accept lossy images, such as JPEG.** Each image has already lost
   information, and a lossless video of the decoded images would take much
   more space than the JPEGs themselves.
 - **A lossy video, such as AV1.** It takes much less space: the
   [file size graph][av1-filesize] of the image-sequence PoC shows the same
-  60 8K images in 12 MiB with SVT-AV1 at preset 5 and CRF 18, 159 times
-  less than as PNG. But it loses information: it is visually lossless, not
-  lossless, 16-bit images become 10-bit frames, the alpha channel is
-  dropped, and the colors go through a conversion. It also needs the
-  SVT-AV1 encoder and the dav1d decoder besides FFmpeg. It could come back
-  as a second, compact version of the video (see the open questions).
+  60 8K images in 12 MiB with SVT-AV1, 159 times less than as PNG. But it
+  loses information: it is visually lossless, not lossless, 16-bit images
+  become 10-bit frames, the alpha channel is dropped, and the colors go
+  through a conversion.
+- **A Matroska file instead of MP4.** Its frames cannot be cut into DASH
+  segments read as byte ranges of the file.
+- **A CSV frame index.** It needs another library, and keeps only text.
+  Parquet is already used everywhere in `mosaicod`, and keeps every type.
 
 ## Open questions
 
@@ -321,110 +411,148 @@ can only be answered while implementing, and can stay open.
 
 ### When the optimizer runs
 
-- **Question:** A topic waits until the next run of the optimizer, which can
-  be much later than the upload, or never if nobody starts it. Should the
-  optimizer start as soon as an upload is finalized?
-  - **Proposal:** when a session is finalized, `mosaicod server` sends a
-    PostgreSQL `NOTIFY`. The optimizer runs as a long-lived process that
-    `LISTEN`s and starts optimizing right away, keeping `--time-interval`
-    as a fallback for the notifications missed while it was down. This
-    works across processes, and the leases already keep several optimizers
-    from working on the same topic.
-- **Question:** Should `mosaicod server` start the optimizer itself, or
-  should it stay a separate process?
-  - **Proposal:** keep it separate, so that encoding does not take the CPU
-    of the server and can run on other machines. The deployment starts it
-    as a long-lived process next to the server.
+- **Question:** A topic waits until the next run of the optimizer, which
+  can be much later than the upload, or never. Should the optimizer start
+  as soon as an upload is finalized?
+  - **Proposal:** the server notifies the database when an upload is
+    finalized, and the optimizer, always running, starts right away.
+- **Question:** Should `mosaicod server` start the optimizer itself?
+  - **Proposal:** no, keep it separate, so that encoding does not take the
+    CPU of the server and can run on another machine.
+
+### The optimizer
+
+- **Question:** A `failed` topic is tried again at every run, with a new
+  notification each time, forever. Should the retries stop at some point?
+  - **Proposal:** after a number of attempts, turn the issue into a
+    permanent one.
+- **Question:** If an optimizer crashes while encoding, its topic stays
+  leased for 7 days. Is that too long for image sequences?
+  - **Proposal:** renew the lease while encoding, and make it shorter.
+- **Question:** The images are decoded in memory, and their size is not
+  limited: a PNG can declare a huge image. Should there be a limit?
+  - **Proposal:** a maximum number of pixels per image, in the settings.
 
 ### Loss of information
 
-- **Question:** The video keeps the pixels, but the original files are
-  deleted after the retention period. Should the original files be kept
-  somewhere, considering how much keeping both the images and the video
-  costs?
-- **Question:** Why does the cleanup wait for a retention period before
-  deleting the files the store no longer uses, and is 24 hours right for
-  image sequences? Until it is over, a topic takes the space of both the
-  images and the video, and image sequences are often the largest part of
-  a recording.
-  - **Proposal:** write down why the cleanup waits, then decide whether
-    image sequences need a retention period of their own.
-- **Question:** FFV1 takes only 1.5 times less space than the PNGs. Should
-  a topic also get a compact, lossy version of its video, such as AV1, for
-  the clients that only need to look at the images?
-  - **Proposal:** not now: add it as an option of a topic when users need
-    it, as a second version next to the FFV1 one.
+- **Question:** PNG files are deleted after the retention period. Should
+  they be kept somewhere?
+- **Question:** Is 24 hours of retention right for image sequences, which
+  take the space of both the images and the video until then?
+- **Question:** Should a topic also get a lossy video, such as AV1, for
+  the clients that only look at the images?
+  - **Proposal:** not now. Add it later as a second video, when users need
+    it.
+
+### Queries
+
+- **Question:** The catalog queries and the time range info of a topic
+  read its files as Parquet. Once the topic is a video, its files are the
+  video and the frame index. How do they work on an optimized topic?
+  - **Proposal:** read the frame index instead: it has every column but
+    the images.
+- **Question:** The images are filtered by the time they were recorded,
+  the video by the seconds of capture. Is having two timelines confusing?
+  - **Proposal:** keep both, and let the images be filtered by capture time
+    too.
+
+### Reading back
+
+- **Question:** Reading the images of a video needs a server with video
+  support, which the default `mosaicod` image does not have. Should every
+  server have it?
+  - **Proposal:** yes: the server image links FFmpeg too, as the optimizer
+    image does.
+- **Question:** The server decodes the video and encodes the PNGs again at
+  every read of the images. Can many clients read at once?
+  - **Proposal:** limit the reads decoded at the same time.
+- **Question:** A segment is read whole in memory. A second of 8K video at
+  60 fps is more than a gigabyte. Should a segment be streamed instead?
+  - **Proposal:** stream the fragments of a segment one at a time.
+- **Question:** Segments last one second. Is it right for every camera,
+  from one image every few seconds to hundreds per second?
+- **Question:** The Python SDK cannot read the video yet. What should it
+  offer?
+  - **Proposal:** read the segments of an interval, and decode them into
+    images with PyAV.
+
+### ROS images
+
+- **Question:** A ROS image whose stamp is zero has no capture time. The
+  time it was recorded in the bag is not it. What should we do with these
+  images?
+- **Question:** A ROS `CompressedImage` in PNG is lossless. Should it
+  become an `ImageSequence`?
+  - **Proposal:** yes, when every image of the topic is a PNG.
+- **Question:** An `ImageSequence` cannot be exported to ROS. Should it?
+  - **Proposal:** export it as a `CompressedImage` in PNG.
+
+### `Image`
+
+- **Question:** What happens to the `Image` topics already stored? Should
+  they be converted?
+  - **Proposal:** convert the raw ones into `ImageSequenceRaw` with a
+    command, so that they become videos too.
+- **Question:** When is `Image` removed?
 
 ### Checking the images
 
-- **Question:** The upload accepts any bytes, and the client learns about a
-  bad image only after the optimizer has run. Should the upload reject the
-  bad images right away?
-  - **Proposal:** the upload runs only the cheap checks (format declared,
-    supported and the same for all the images, valid signature of the
-    bytes) and rejects the batch. Decoding the pixels stays in the
-    optimizer.
-- **Question:** How does a user find out that a topic has an issue? Today
-  it is written only in the database, with no API to read it.
-  - **Proposal:** expose the issue and its message with the optimization
-    state of the topic, through the API and the Python SDK.
-- **Question:** Clearing an issue means editing the database by hand.
-  Should there be an API or a command for it?
-  - **Proposal:** a `mosaicod` command that clears the issue of a topic and
-    queues it again for the optimizer.
-- **Question:** A topic with `unsupported` is never tried again. If a later
-  version supports what was missing (different sizes, other layouts), how
-  are those topics optimized again?
-  - **Proposal:** the same command clears every `unsupported` issue at once,
-    to run after an upgrade.
-- **Question:** The `format` is repeated in every message, but must be the
-  same in all of them. Should it be declared once per topic?
-  - **Proposal:** declare it in the metadata of the topic, at creation, and
-    remove the field from the messages.
+- **Question:** Should the upload reject bad images right away?
+  - **Proposal:** the upload runs only the cheap checks, such as a missing
+    or unsupported format. Decoding stays in the optimizer.
+- **Question:** A topic with an issue is never optimized again. How is it
+  optimized after a version that supports it?
+  - **Proposal:** a `mosaicod` command that queues these topics again.
+- **Question:** The `format` of PNGs is the same in every message. Should
+  it be declared once per topic?
+  - **Proposal:** declare it in the metadata of the topic.
 
 ### Supported images
 
-- **Question:** Images of different sizes are `unsupported`. Is a change of
-  resolution in the middle of a recording a real case for the users?
-  - **Proposal:** if it is, start a new video each time the size changes.
-- **Question:** CMYK or floating point TIFFs, and other lossless formats
-  (for example raw Bayer) are not supported. Which of them do users need?
-  - **Proposal:** keep them as Parquet with the `unsupported` issue, and add
-    a lossless format when users ask for it.
-
-### Deployment
-
-- **Question:** `mosaicod` now depends on FFmpeg built from source. Is
-  this acceptable for every deployment?
-  - **Proposal:** make FFmpeg an optional dependency, so that a build
-    without FFmpeg leaves image sequences as Parquet.
+- **Question:** Images of different sizes are `unsupported`. Do users
+  change resolution in the middle of a recording?
+  - **Proposal:** if they do, start a new video at each change.
+- **Question:** YUV raw images (`yuv422`, `uyvy`, `yuyv`) are
+  `unsupported`. Should they become videos too?
+  - **Proposal:** yes: their samples can be rearranged into planes, which
+    FFV1 encodes losslessly.
+- **Question:** Depth images in floating point (`32FC1`) are `unsupported`:
+  FFV1 has no single channel of 32-bit floats. Should they become videos?
+  - **Proposal:** split each float into two 16-bit channels, if users need
+    it.
+- **Question:** Raw images whose row padding is not zero are `unsupported`,
+  because the video loses the padding. Should they become videos too?
+  - **Proposal:** keep the padding apart, for example in the frame index.
 
 ### Left to the implementation
 
 These questions can only be answered by measuring or testing the
 implementation, so they can stay open after this RFC is approved.
 
-- **Question:** The topic still has the `ImageSequence` serialization
-  format, but its data is no longer Parquet. Do the queries on the topic
-  (time ranges, filters on `format` and `capture_timestamp_ns`) still work,
-  and which part of the code reads a video chunk?
-  - **Proposal:** add an integration test that queries an optimized topic,
-    to find out what breaks.
-- **Question:** Several frames in the same millisecond are moved forward by
-  1 ms each, so the video timestamps can drift from the capture times. Is
-  this a problem for cameras faster than 1000 fps?
-  - **Proposal:** `timestamps.csv` is the only source of the times, the
-    video timestamps only order the frames. Measure the drift on real
-    recordings.
-- **Question:** Each optimizer encodes one topic at a time. How long does a
-  long, high-resolution sequence take, and does it delay the other topics
-  in the queue?
+- **Question:** Do the queries that filter on the fields of an image
+  sequence still work once the topic is a video?
+  - **Proposal:** add an integration test that queries an optimized topic.
+- **Question:** How long does a long, high-resolution sequence take to
+  encode, and does it delay the other topics in the queue?
   - **Proposal:** measure it on real recordings, and run more optimizers
-    when needed: the leases already allow it.
-- **Question:** The video is written first to a local temporary file, as
-  big as the video. How much local disk does the optimizer need?
-  - **Proposal:** document it: each optimizer needs free local disk at least
-    as big as the largest video it encodes.
+    when needed.
+- **Question:** How much local disk does the optimizer need?
+  - **Proposal:** document it: at least as much as the largest video it
+    encodes.
+- **Question:** Small images get a fragment each, with a header of its own.
+  Can the video take more space than the images?
+  - **Proposal:** measure it, and keep the images in Parquet when it does.
+- **Question:** The frame index has no version. How is its layout changed
+  later?
+  - **Proposal:** write a version in its metadata.
+- **Question:** Long gaps between frames rely on internals of FFmpeg's MP4
+  writer. Do they still work with the next versions of FFmpeg?
+  - **Proposal:** keep the test of long gaps, and run it at every upgrade
+    of FFmpeg.
+- **Question:** The ZSTD level of the Parquet columns can only be built at
+  runtime, with an error to handle. Can the Parquet library build a valid
+  level without it?
+  - **Proposal:** propose it upstream, to Apache Arrow.
 
 [implementation]: #left-to-the-implementation
 [ffv1-analysis]: https://github.com/mosaico-labs/video-pocs/tree/main/ffv1-analysis
