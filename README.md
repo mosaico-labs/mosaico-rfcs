@@ -82,6 +82,11 @@ usually has these sections:
   internals of Mosaico and not what a user sees. Write them as the open
   questions. They can stay open after the RFC is approved, and they are
   answered while implementing.
+- **From RFC to discussions**: how the RFC is split into parts once it is
+  approved. Each part becomes a discussion, so for each one list the
+  sections of the RFC it comes from, the crates it touches and the
+  questions it answers. Show which parts build on which, so that the parts
+  that do not depend on each other can be implemented at the same time.
 
 Wrap the text at 79 columns, so that it reads well both in an editor and
 on GitHub.
@@ -126,14 +131,15 @@ does not mean it will be implemented right away, or exactly as written.
 
 To implement an approved RFC:
 
-1. **Split the RFC into parts.** Each part can be implemented on its own,
-   for example the ontology, a new crate, or a change to a background
-   process.
+1. **Split the RFC into parts**, as its **From RFC to discussions** section
+   describes. Each part can be implemented on its own, for example the
+   ontology, a new crate, or a change to a background process.
 2. **Open a discussion for each part**, in the
    [Issue category][discussions] of the Mosaico discussions. Link the RFC
-   and the section the part comes from, and describe how you plan to
+   and the sections the part comes from, and describe how you plan to
    implement it. The discussion checks that this way of implementing it is
-   reasonable, and that it fits the roadmap.
+   reasonable, and that it fits the roadmap. It also answers the questions
+   of the part that were **left to the implementation**.
 3. **Follow the [contribution guidelines][contributing]** of the Mosaico
    repository from there: once the discussion is approved, one or more
    issues are opened, and each issue is solved by one or more pull
