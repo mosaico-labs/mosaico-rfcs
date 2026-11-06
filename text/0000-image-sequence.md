@@ -638,6 +638,18 @@ The SDK adds the two ontologies and their serialization formats, deprecates
 - **A Matroska file instead of MP4.** Its frames cannot be cut into DASH
   segments that are read as byte ranges of the file.
 
+## Out of scope
+
+These questions are related to image sequences, but they depend on
+decisions that this RFC does not take, so they are left to separate RFCs
+and do not block the approval of this one.
+
+- **`CompressedImage` in PNG.** A ROS `CompressedImage` in PNG is lossless,
+  so it could become an `ImageSequence`. However, this RFC does not change
+  `CompressedImage`, and what to do with it, including its PNG images, is
+  not defined yet. So this question is answered together with the future
+  of `CompressedImage`.
+
 ## Open questions
 
 Each question is followed by a proposal, when there is one, as a starting
@@ -975,18 +987,6 @@ they can stay open.
 - **Question:** Raw images whose row padding is not zero are `unsupported`,
   because the video loses the padding. Should they become videos too?
   - **Proposal:** keep the padding apart, for example in the frame index
-
-## Out of scope
-
-These questions are related to image sequences, but they depend on
-decisions that this RFC does not take, so they are left to separate RFCs
-and do not block the approval of this one.
-
-- **`CompressedImage` in PNG.** A ROS `CompressedImage` in PNG is lossless,
-  so it could become an `ImageSequence`. However, this RFC does not change
-  `CompressedImage`, and what to do with it, including its PNG images, is
-  not defined yet. So this question is answered together with the future
-  of `CompressedImage`.
 
 ## Left to the implementation
 
