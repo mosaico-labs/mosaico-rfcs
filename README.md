@@ -73,6 +73,9 @@ usually has these sections:
 - **Drawbacks**: why we should *not* do this.
 - **Alternatives**: the other designs considered, and why this one is
   better.
+- **Out of scope**: the questions related to the RFC that depend on
+  decisions it does not take. They are left to separate RFCs, so they do
+  not block its approval.
 - **Open questions**: what is still to be decided. Write each one as a
   **Question:**, followed by a **Proposal:** when there is one. These
   questions are about the design, so they must be answered before the RFC
