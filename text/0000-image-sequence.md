@@ -82,35 +82,47 @@ three problems that prevent the server from turning a topic into a video:
   and raw pixels shrink only a little, so the stored images take almost as
   much space as the original ones.
 
-{The new ontologies fix these problems. With them, every message of a topic
-holds one image, all the images of a topic are of the same kind, and each
-image has its capture time. So the server knows from the ontology what a
-topic holds, and it can check the images of the topic and then turn them
-into a single video, without losing anything. / claude: seems too complex to me yet}
+The new ontologies solve these problems, because each of them holds a single
+kind of image, and every image has its capture time. So the server can check
+the images of a topic and then turn them into a single video, without losing
+any data.
 
 For this reason, we introduced two ontologies that split `Image` by kind of
 image:
 
 - `ImageSequence` for PNGs, which are already compressed when they reach
   the server.
-- `ImageSequenceRaw` for raw images, which are the largest data and so the
-  ones the conversion to video compresses the most. The ontology keeps every
-  field of a ROS image message, so that a ROS bag can be rebuilt exactly.
+- `ImageSequenceRaw` for raw images, which are the largest data, and so the
+  ones that the video compresses the most. The ontology keeps every field of
+  a ROS image message, so that a ROS bag can be rebuilt exactly.
 
-Each ontology has only the fields its kind of image needs, and they are
-required, so that every message fully describes its image. The only
-optional fields are `frame_id`, the coordinate frame of the camera, and
-`sample_counter`, the number of the image. They come from the ROS header,
-and not every source fills them: for example, `sample_counter` exists only
-in ROS 1. The capture time, instead, is required, and it is a field of its
-own, `capture_timestamp_ns`, while in `Image` it is inside the optional
-header.
+```mermaid
+flowchart TD
+    IMAGE["Image (deprecated)"]
+    SEQ["ImageSequence"]
+    RAW["ImageSequenceRaw"]
+
+    IMAGE -->|"format: png"| SEQ
+    IMAGE -->|"format: raw"| RAW
+```
+
+Each ontology has **only** the fields its kind of image needs, so that every
+message fully describes its image. All of them are required, except the two
+that come from the ROS header, because not every source fills them:
+
+- `frame_id`, the coordinate frame of the camera.
+- `sample_counter`, the number of the image, which exists only in ROS 1,
+  where it is the `seq` field of the header.
+
+The capture time, instead, which in ROS is the `stamp` field of the header,
+is **always** required. In the new ontologies it is a field of its own, called
+`capture_timestamp_ns`, while in `Image` it is inside the optional header.
 
 ## Design
 
 ### The data flow, from client to server
 
-An image sequence goes through four phases. Only the first one involves the
+An image sequence goes through five phases. Only the first one involves the
 client and the server, `mosaicod server`, while the others run later in two
 separate processes of the same binary: `mosaicod store-optimizer` and
 `mosaicod cleanup`.
@@ -118,15 +130,17 @@ separate processes of the same binary: `mosaicod store-optimizer` and
 ```mermaid
 flowchart TD
     U["1. Upload<br/>the client sends the images,<br/>mosaicod server writes them as Parquet"]
-    C["2. Check<br/>the store optimizer<br/>checks the PNGs"]
-    E["3. Encode<br/>the store optimizer<br/>writes the FFV1 video"]
-    D["4. Cleanup<br/>the cleanup process deletes<br/>the old Parquet files"]
+    C["2. Check<br/>the store optimizer<br/>checks the images"]
+    E["3. Encode<br/>the store optimizer writes the FFV1 video<br/>and its frame index in a new folder"]
+    S["4. Switch<br/>a database transaction<br/>moves the topic to the new folder"]
+    D["5. Cleanup<br/>the cleanup process deletes<br/>the old Parquet files"]
     I["Issue notified on the topic,<br/>which keeps its Parquet files"]
     U --> C
     C -->|"every image is valid"| E
     C -->|"an image is not valid"| I
-    E -->|"the video replaces the Parquet files"| D
+    E -->|"the video is written"| S
     E -->|"the images cannot become a video"| I
+    S -->|"the old folder is no longer used"| D
 ```
 
 1. **Upload.** The client creates a topic with one of the two ontologies
@@ -134,19 +148,27 @@ flowchart TD
    Parquet files. The server **does not check the images**, because
    decoding them would make the upload too slow.
 2. **Check.** Later, the **store optimizer** takes the complete topics that
-   are not optimized yet. By default it runs once and then exits, but it can
-   also run in a loop. Several optimizers can run at the same time, because
-   each topic is leased to only one of them. For PNGs, the optimizer checks
-   every image without decoding it: the format must be declared, supported
-   and the same for all the images, and the bytes must really be a PNG. Raw
-   images, instead, have nothing to check without decoding them.
+   are not optimized yet, and if the topic is an `ImageSequence`, it checks
+   every image without decoding it:
+   - the `format` field of the image is not empty, and its value is a
+     format the server can turn into a video, which currently is only `png`
+   - the format is the same for all the images of the topic
+   - the bytes of the image really are an image of the format declared in
+     its `format` field
+
+   If the topic is an `ImageSequenceRaw`, instead, the raw images cannot be
+   checked without decoding them, so they are checked in the next Encode
+   phase. While they are decoded, their bytes must match the size and the
+   stride given by their `width`, `height` and `stride` fields.
 3. **Encode.** The optimizer decodes each image once and then encodes the
    images into a lossless **FFV1 video**. The video and its frame index are
-   written in a new folder of the store, and then a single database
-   transaction switches the topic to that folder.
-4. **Cleanup.** The old folder with the Parquet files is no longer used, so
-   the **cleanup** marks it and deletes it after the retention period. Like
-   the optimizer, it runs once or in a loop.
+   written in a new folder of the store, while the topic still uses its
+   original folder.
+4. **Switch.** Once the video is written, a single database transaction
+   switches the topic to the new folder, so that from then on the topic
+   contains the video instead of the images.
+5. **Cleanup.** The old folder with the Parquet files is no longer used, so
+   the **cleanup** marks it and deletes it after the retention period.
 
 ### The ontologies
 
@@ -172,21 +194,22 @@ message has `timestamp_ns`, which is when the image was **recorded**.
 | `height` | `uint32` | no | Rows. |
 | `stride` | `uint32` | no | Bytes per row, padding included. |
 | `encoding` | `string` | no | The pixel encoding, as in ROS: `mono8`, `bgr8`, `16UC1`... |
-| `is_bigendian` | `bool` | yes | Whether 16-bit samples are big-endian. Little-endian if null. |
+| `is_bigendian` | `bool` | yes | Whether 16-bit samples are big-endian. If null, it is read as `false`, so the samples are little-endian, but it is kept null in the stored data. |
 | `frame_id` | `string` | yes | The coordinate frame of the camera, from the ROS header. |
 | `sample_counter` | `uint64` | yes | The number of the image, from the ROS 1 header (`seq`). |
 | `data` | `binary` | no | The pixels, `stride × height` bytes. |
 
 Queries can filter on every field except `data`.
 
-Only **lossless** images are accepted, so that the server stores exactly
-what the camera produced. Lossy images, such as JPEG, stay in
-`CompressedImage`.
+Only **lossless** images are considered by these ontologies, so that the
+server stores exactly what the camera produced. Lossy images, such as JPEG,
+are handled by the `CompressedImage` ontology.
 
 ### ROS images
 
-The ROS bridge turns a `sensor_msgs/Image` into an `ImageSequenceRaw`, and
-on export it turns it back into the same message:
+In ROS, a raw camera image is a message of type `sensor_msgs/Image`. The ROS
+bridge turns each of these messages into an `ImageSequenceRaw`, and on
+export it turns it back into the same message:
 
 | ROS | `ImageSequenceRaw` |
 |---|---|
@@ -198,7 +221,7 @@ on export it turns it back into the same message:
 | `data` | `data` |
 
 An image whose stamp is zero has no capture time, so it is not translated
-(see the open questions).
+(see the [open questions about ROS images][ros-open-questions]).
 
 ### `Image` is deprecated
 
@@ -393,6 +416,10 @@ So the store optimizer can run on a machine with FFmpeg and the server on
 another one. When it starts, the optimizer checks that its FFmpeg has the
 FFV1 codec and the MP4 format, and if it does not, it logs an error and
 leaves the image sequences in the queue.
+
+By default, both the store optimizer and the cleanup run once and then
+exit, but they can also run in a loop. Several optimizers can run at the
+same time, because each topic is leased to only one of them.
 
 ### The `mosaicod` crates
 
@@ -658,6 +685,37 @@ they can stay open.
 
 ### Supported images
 
+- **Question:** Image sequences accept only lossless images, so JPEG images,
+  which are lossy, stay in `CompressedImage`. Should image sequences accept
+  JPEG images too, so that they also get a capture time and a frame index?
+  A lossless video of the decoded JPEGs would take much more space than the
+  JPEGs themselves (see the alternatives), so the options are:
+  - keep the JPEG images as they are, without a video;
+  - put the JPEG images, without decoding them, into a Motion JPEG video,
+    which keeps every image byte for byte, but which browsers cannot play;
+  - encode them into a lossy video, which loses more information at every
+    encoding.
+  - **Proposal:** not now. Image sequences accept only lossless images, and
+    JPEG can be added later as a new format, if users need it.
+- **Question:** Each image is one message, and a message cannot be split
+  inside an image, so every image must fit in a single gRPC message. The
+  server accepts incoming messages of up to 50 MiB by default
+  (`MOSAICOD_GRPC_MAX_DECODE_MESSAGE_SIZE`), which can be raised to at most
+  512 MiB. Large raw images do not fit with the default limit:
+
+  | Image | Size |
+  |---|---|
+  | 4K `rgb8` | 23.7 MiB |
+  | 4K `rgba16` | 63.3 MiB |
+  | 8K `mono8` | 31.6 MiB |
+  | 8K `rgb8` | 94.9 MiB |
+  | 8K `rgba16` | 253.1 MiB |
+
+  How should these images be uploaded?
+  - **Proposal:** for now, document the limit and raise it for the servers
+    that receive large images, which covers images of up to 512 MiB. If
+    larger images are needed, split each image into several messages, but
+    this changes the ontology and the protocol.
 - **Question:** Images of different sizes are `unsupported`. Do users change
   resolution in the middle of a recording?
   - **Proposal:** if they do, start a new video at each change.
@@ -710,6 +768,8 @@ a client sees, so they can stay open after this RFC is approved.
   with an error to handle. Can it build a valid level without one?
   - **Proposal:** propose it upstream, to Apache Arrow.
 
-[implementation]: #left-to-the-implementation[ffv1-analysis]: https://github.com/mosaico-labs/video-pocs/tree/main/ffv1-analysis
+[implementation]: #left-to-the-implementation
+[ros-open-questions]: #ros-images-1
+[ffv1-analysis]: https://github.com/mosaico-labs/video-pocs/tree/main/ffv1-analysis
 [filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/ffv1-analysis/results/reference/ffv1/filesize-input.svg
 [av1-filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/image-sequence/video-results/regular/batch_060/preset_5_crf_18/filesize-comparison/filesize-comparison.svg
