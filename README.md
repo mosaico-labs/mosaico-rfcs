@@ -74,9 +74,14 @@ usually has these sections:
 - **Alternatives**: the other designs considered, and why this one is
   better.
 - **Open questions**: what is still to be decided. Write each one as a
-  **Question:**, followed by a **Proposal:** when there is one. Questions
-  about the design must be answered before the RFC is approved. Only
-  questions that depend on the implementation can stay open.
+  **Question:**, followed by a **Proposal:** when there is one. These
+  questions are about the design, so they must be answered before the RFC
+  is approved.
+- **Left to the implementation**: the questions that can only be answered
+  by measuring or testing the implementation, or that change only the
+  internals of Mosaico and not what a user sees. Write them as the open
+  questions. They can stay open after the RFC is approved, and they are
+  answered while implementing.
 
 Wrap the text at 79 columns, so that it reads well both in an editor and
 on GitHub.
