@@ -148,8 +148,10 @@ flowchart TD
    Parquet files. The server **does not check the images**, because
    decoding them would make the upload too slow.
 2. **Check.** Later, the **store optimizer** takes the complete topics that
-   are not optimized yet, and if the topic is an `ImageSequence`, it checks
-   every image without decoding it:
+   are not optimized yet. A topic finalized without any image has nothing to
+   optimize, so its optimization ends here, without a video and without a
+   notification, and the topic stays empty. Otherwise, if the topic is an
+   `ImageSequence`, the optimizer checks every image without decoding it:
    - the `format` field of the image is not empty, and its value is a
      format the server can turn into a video, which currently is only `png`
    - the format is the same for all the images of the topic
@@ -194,7 +196,7 @@ message has `timestamp_ns`, which is when the image was **recorded**.
 | `height` | `uint32` | no | Rows. |
 | `stride` | `uint32` | no | Bytes per row, padding included. |
 | `encoding` | `string` | no | The pixel encoding, as in ROS: `mono8`, `bgr8`, `16UC1`... |
-| `is_bigendian` | `bool` | yes | Whether 16-bit samples are big-endian. If null, it is read as `false`, so the samples are little-endian, but it is kept null in the stored data. |
+| `is_bigendian` | `bool` | yes | Whether 16-bit samples are big-endian, otherwise little-endian. |
 | `frame_id` | `string` | yes | The coordinate frame of the camera, from the ROS header. |
 | `sample_counter` | `uint64` | yes | The number of the image, from the ROS 1 header (`seq`). |
 | `data` | `binary` | no | The pixels, `stride × height` bytes. |
@@ -221,7 +223,10 @@ export it turns it back into the same message:
 | `data` | `data` |
 
 An image whose stamp is zero has no capture time, so it is not translated
-(see the [open questions about ROS images][ros-open-questions]).
+(see the [open questions about ROS images][ros-open-questions]). The ROS
+bridge creates a topic only when its first message is translated, so a ROS
+topic whose images all have a zero stamp is not created at all, instead of
+being left empty.
 
 ### `Image` is deprecated
 
@@ -231,66 +236,132 @@ stored are still exported to ROS.
 
 ### The serialization formats
 
-`ImageSequence` and `ImageSequenceRaw` are two new serialization formats. On
-disk they are Parquet files, like the other formats, and only the settings
-of each column change:
+There are two new serialization formats, `ImageSequence` and
+`ImageSequenceRaw`, one for each ontology. On disk they are Parquet files,
+like the other formats, and only the settings of each column change. The
+formats find the columns by their names, so the fields of the ontologies
+must not be renamed.
+
+`ImageSequence`:
 
 | Column | Compression | Statistics |
 |---|---|---|
 | `timestamp_ns` | none | page statistics and a bloom filter |
-| `capture_timestamp_ns` | ZSTD | page statistics |
-| `format`, `frame_id`, and for raw images `width`, `height`, `stride`, `encoding`, `is_bigendian` | dictionary, then ZSTD | page statistics |
-| `data` of a PNG | none, it is already compressed | none |
-| `data` of a raw image | ZSTD, fast | none |
-| any other column | none | none |
+| `capture_timestamp_ns` | ZSTD, level 5 | page statistics |
+| `format`, `frame_id` | dictionary, then ZSTD, level 5 | page statistics |
+| `data` | none, because a PNG is already compressed | none |
+| `sample_counter` and any other column | none | none |
 
-The formats find the columns by their names, so the fields of the
-ontologies must not be renamed.
+`ImageSequenceRaw`:
 
-### The issues
+| Column | Compression | Statistics |
+|---|---|---|
+| `timestamp_ns` | none | page statistics and a bloom filter |
+| `capture_timestamp_ns` | ZSTD, level 5 | page statistics |
+| `width`, `height`, `stride`, `encoding`, `is_bigendian`, `frame_id` | dictionary, then ZSTD, level 5 | page statistics |
+| `data` | ZSTD, level 3 | none |
+| `sample_counter` and any other column | none | none |
+
+The `data` of a raw image is compressed with ZSTD level 3, because it is a
+good balance between space and speed.
+
+### Store optimizer errors
 
 When the optimizer finds a problem, it **leaves the topic as the client sent
-it**, so the topic stays readable, and it writes the problem in an `error`
-notification on the topic: `store optimizer/<issue>: <details>`. The issues
-are:
+it**, so the topic stays readable. Then it adds an error notification to the
+topic, which is a new row of the `topic_notification_t` table of the
+database, with the id of the topic, the type `error`, and the error message
+`store optimizer/<issue>: <details>`. The `<issue>` value can be one of these:
 
 - `format_mismatch`: a PNG has no format, an unsupported one, or one
   different from the other images.
 - `undecodable`: a PNG is not valid or its pixels are corrupted, or the
   bytes of a raw image do not match its size and stride.
 - `unsupported`: the images cannot become a video without losing
-  information. For example, the images have different sizes, a required
-  field is missing, a raw encoding cannot be held by the video yet, or the
-  topic has no images. The same happens when a column has a name that the
-  frame index uses for itself: `frame`, `video_timestamp_us`,
-  `fragment_offset` or `fragment_size`. Any other column the client adds is
-  kept in the frame index.
+  information, because:
+  - a required field is missing
+  - the images have different sizes, color types or bit depths
+  - a PNG has a layout that cannot be decoded
+  - a raw image has an encoding the video cannot hold yet
+  - a raw image has row padding that is not zero: the padding is made of
+    the bytes at the end of each row that are not pixels, and the video
+    keeps only the pixels, so it would lose them (see the [open questions
+    about supported images][supported-images])
+  - a field added by extending the ontology has the name of a column of the
+    frame index: `frame`, `video_timestamp_us`, `fragment_offset` or
+    `fragment_size`. Any other added field, for example `exposure_us`, is
+    always kept in the frame index.
 - `failed`: something outside the data failed, such as the encoder, the
   store, the network or the database.
 
-The first three issues depend on the data, so the optimization of the topic
-ends and it is never tried again. A `failed` topic, instead, is tried again
-at the next run, with a notification at every attempt.
+The first three issues depend on the data, so **the optimization of the topic
+ends and it is never tried again**. A `failed` topic, instead, is tried again
+at the next run, and a **new notification** is added every time an attempt
+fails.
 
 ### The video
 
 After the optimizer, the topic is no longer stored as Parquet files, and its
 folder holds the video, `video.mp4`, and its frame index,
-`timestamps.parquet`.
+`frame_index.parquet`:
 
-The video is encoded with FFV1, the lossless codec of FFmpeg, in a
-fragmented MP4 file, which is a header followed by one fragment per image.
-The fragments follow the capture order, by `capture_timestamp_ns` and then
-by `timestamp_ns` for equal capture times. Every frame is a keyframe, so
-each fragment can be decoded on its own.
+```mermaid
+flowchart TD
+    DB[("database:<br/>the topic")]
+    OLD["tp_&lt;old id&gt;/ (original folder)<br/>metadata.json<br/>data/00000.parquet<br/>data/00001.parquet<br/>..."]
+    NEW["tp_&lt;new id&gt;/ (new folder)<br/>metadata.json<br/>data/video.mp4<br/>data/frame_index.parquet"]
+
+    DB -->|"after the switch"| NEW
+    DB -.->|"before the switch,<br/>then deleted by the cleanup"| OLD
+```
+
+The codec and the container of the video are two separate choices:
+
+- The **codec** compresses the pixels of each frame. It is FFV1 version 3,
+  the lossless codec of FFmpeg, in 16 slices, each checked with a CRC.
+- The **container** is how the frames are stored in the file. It is a
+  fragmented MP4 file, which is the format of MPEG-DASH segments, so the
+  server can send the video as MPEG-DASH without converting it.
+
+The fragmented MP4 file is made of a header followed by one fragment per
+image:
+
+- The header (`ftyp` and `moov` boxes) describes the video: its size, its
+  pixel format and its codec.
+- Each fragment (`moof` and `mdat` boxes) holds one frame, with the time at
+  which it starts in the video.
+
+Every frame is a keyframe, so each fragment can be decoded on its own. With
+codecs such as H.264 or AV1, making every frame a keyframe would make the
+video much larger than with their usual settings, because normally they
+store most frames as differences from the previous ones. FFV1, instead, is
+intra-only: it always compresses each frame on its own, so making every
+frame a keyframe barely changes the size of the video. In
+exchange, any frame can be read without the others, so reading a short time
+range decodes only its images, and a corrupted frame does not affect the
+others.
+
+This also makes MPEG-DASH simple: the header is the first segment, and every
+other segment is just the fragments of one second of video. So the server
+builds the segments by copying parts of the file, without decoding it.
+
+The fragments follow the capture order, by `capture_timestamp_ns`. When two
+images have the same capture time, for example because a driver reported
+the same stamp twice, they are ordered by `timestamp_ns`, so that their
+order is always the same, and it is the order in which they were recorded
+(see the [open questions about the optimizer][optimizer-open-questions]).
 
 Each frame is placed at its capture time, in microseconds from the first
-frame and rounded. Two frames cannot share a time, so a frame that would
-land on the previous one is moved 1 µs after it. For this reason the video
-times are approximate, and they are used only to place the frames in the
-video and to cut it into segments. The exact timestamps, in nanoseconds, are
-in the frame index, which is used to filter, sort and read back the images,
-and every segment carries the exact timestamps of its frames.
+frame, rounded to the nearest microsecond. MP4 requires every frame to come
+strictly after the previous one, but two frames can land on the same time:
+when two images have the same capture time, or when two different times
+round to the same microsecond, for example 1,000 ns and 1,400 ns, which are
+both 1 µs. In that case, the later frame is moved 1 µs after the previous
+one. For this reason the video times are approximate, and they are used
+only to place the frames in the video and to cut it into segments. The
+exact timestamps, in nanoseconds, are in the frame index, which is used to
+filter, sort and read back the images, and every segment carries the exact
+timestamps of its frames.
 
 The frames keep exactly the pixels of the images, without any color
 conversion, so a frame is gray, gray with alpha, RGB or RGBA, of 8 or 16
@@ -307,14 +378,14 @@ Raw images can become a video in these encodings:
 
 BGR pixels are swapped into RGB, and back when they are read. Big-endian
 samples are read in their byte order and written back in it. The row
-padding must be zero, and it is written back as zero.
+padding must be zero, and it is written back as zero (see the [open
+questions about supported images][supported-images]).
 
-The **frame index** is a Parquet file with one row per frame. The row holds
-where the fragment of the frame is in the video and its time in the video,
-together with every column of the image except `data`, as it was uploaded
-and including the columns the client added. The file also keeps the schema
-the images were uploaded with and its metadata. An image is then read back
-as its row, with its frame decoded as `data`.
+The **frame index** is a Parquet file with one row per frame. Each row says
+where the frame is in the video and at which time, and it keeps every field
+of the image except `data`, exactly as it was uploaded, including the
+fields added by extending the ontology. The file also stores the schema of
+the uploaded images, so that they can be read back with the same schema.
 
 ### Reading back
 
@@ -323,8 +394,10 @@ The client chooses what to read:
 - **The images**, the default, which come back with the schema they were
   uploaded with and sorted by `timestamp_ns`. As for any topic, a time range
   keeps the images whose `timestamp_ns` is in it. Once the topic is a video,
-  raw images come back byte for byte, while PNGs come back pixel for pixel,
-  because the server encodes them again and so their bytes can differ.
+  each image is rebuilt from its row of the frame index, with its frame
+  decoded from the video as `data`. Raw images come back byte for byte,
+  while PNGs come back pixel for pixel, because the server encodes them
+  again and so their bytes can differ.
 - **The video**, as MPEG-DASH, which is a manifest, an initialization
   segment and one media segment per second of video. Every segment starts
   with a keyframe. With no interval, every segment comes back, and together
@@ -576,6 +649,24 @@ they can stay open.
 - **Question:** The images are decoded in memory without a size limit, but a
   PNG can declare a huge image. Should there be a limit?
   - **Proposal:** a maximum number of pixels per image, in the settings.
+- **Question:** The frames of the video follow the capture order, and
+  `timestamp_ns` only breaks ties between equal capture times. This works
+  when the capture times grow with the recording, but two cases are
+  silently changed:
+  - two images with the same capture time, usually a driver bug or a
+    duplicated message: both are kept, and the second one is moved 1 µs
+    later in the video;
+  - capture times that go backwards, for example after a reset of the
+    camera clock: the video puts the later images before the earlier ones.
+
+  The images are always read back exactly, in recording order, so nothing
+  is lost, but the video can differ from what the camera saw. Should the
+  optimizer handle these cases differently?
+  - **Proposal:** keep the current order, but notify the topic when the
+    optimizer finds repeated capture times, or capture times that go
+    backwards, so that the user knows the video differs from the recording.
+    Today the only type of notification is `error`, so this needs a new
+    type, `warning`, because the topic still becomes a video.
 
 ### Loss of information
 
@@ -770,6 +861,8 @@ a client sees, so they can stay open after this RFC is approved.
 
 [implementation]: #left-to-the-implementation
 [ros-open-questions]: #ros-images-1
+[supported-images]: #supported-images
+[optimizer-open-questions]: #the-optimizer
 [ffv1-analysis]: https://github.com/mosaico-labs/video-pocs/tree/main/ffv1-analysis
 [filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/ffv1-analysis/results/reference/ffv1/filesize-input.svg
 [av1-filesize]: https://github.com/mosaico-labs/video-pocs/blob/main/image-sequence/video-results/regular/batch_060/preset_5_crf_18/filesize-comparison/filesize-comparison.svg
