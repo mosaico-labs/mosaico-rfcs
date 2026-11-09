@@ -73,8 +73,9 @@ usually has these sections:
   serialization formats, store layout, database) and the crates involved.
   Use diagrams only when they make the design clearer than text.
 - **Drawbacks**: why we should *not* do this.
-- **Alternatives**: the other designs considered, and why this one is
-  better.
+- **Alternatives**: the other designs considered, each described in
+  short, without discussing them in depth. An alternative worth
+  considering becomes a new RFC.
 - **Open questions**: what is still to be decided. Write each one as a
   **Question:**, followed by a **Proposal:** when there is one. Questions
   about the design must be answered before the RFC is approved. Only
