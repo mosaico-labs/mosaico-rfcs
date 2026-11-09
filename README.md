@@ -62,27 +62,47 @@ and it stands alone without affecting other parts of Mosaico, open a
 
 An RFC should be understandable by someone who does not know the code, and
 precise enough to be split into parts, each one becoming a discussion. It
-usually has these sections:
+has these sections, in this order. A section marked as (required) **must**
+be present in every RFC, while the presence of the others depends on the
+RFC:
 
-- **Summary**: a short description of what the change adds, why, and how
-  it works at a high level, so that a reader gets the idea without reading
-  the rest of the RFC.
-- **Motivation**: the problem it solves, and who is affected by it.
-- **Design**: how it works, across the parts of Mosaico it touches. Explain
-  the new concepts, the data that changes (for example ontologies,
-  serialization formats, store layout, database) and the crates involved.
-  Use diagrams only when they make the design clearer than text.
-- **Drawbacks**: why we should *not* do this.
-- **Alternatives**: the other designs considered, each described in
-  short, without discussing them in depth. An alternative worth
-  considering becomes a new RFC.
-- **Open questions**: what is still to be decided. Write each one as a
-  **Question:**, followed by a **Proposal:** when there is one. Questions
-  about the design must be answered before the RFC is approved. Only
-  questions that depend on the implementation can stay open.
+- **Summary** (required): a short description of what the change adds,
+  why, and how it works at a high level, so that a reader gets the idea
+  without reading the rest of the RFC.
+- **Glossary**: the technical terms of the RFC that a reader may not
+  know, each explained in simple words.
+- **Motivation** (required): the problem it solves, and who is affected by it.
+- **Design** (required): how it works, across the parts of Mosaico it
+  touches. Explain the new concepts, the data that changes (for example
+  ontologies, serialization formats, store layout, database) and the
+  crates involved. Use diagrams only when they make the design clearer
+  than text.
+- **Drawbacks** (required): why we should *not* do this.
+- **Alternatives** (required): the other designs considered, each
+  described in short, without discussing them in depth. An alternative
+  worth considering becomes a new RFC.
+- **Out of Scope**: the related questions this RFC leaves unanswered,
+  because they depend on decisions taken elsewhere. Separate RFCs answer
+  them, so these questions do not block the approval of this RFC.
+- **Open Questions** (required): what is still to be decided. Write each
+  one as a **Question:**, followed by a **Proposal:** when there is one.
+  These questions are about the design, so they must be answered before
+  the RFC is approved.
+- **Left to the Implementation**: the questions that can only be answered
+  by measuring or testing the implementation, or whose answer does not
+  change the design of the RFC. Write them in the same format as the Open
+  Questions. They can stay open after the RFC is approved, and whoever
+  implements a part answers them in the discussion of that part.
+- **From RFC to Discussion** (required): how the RFC is split into parts
+  once it is approved. Each part becomes a discussion, so for each one list
+  the sections of the RFC it comes from, the crates it touches and the
+  questions it answers. Also say which parts depend on others, so that the
+  independent ones can be implemented at the same time.
 
-Wrap the text at 79 columns, so that it reads well both in an editor and
-on GitHub.
+Write the title of the RFC and the names of these sections in title case,
+for example `## Open Questions`, and the names of their subsections in
+sentence case, for example `### The video`. Wrap the text at 79 columns,
+so that it reads well both in an editor and on GitHub.
 
 ## The process
 
@@ -124,14 +144,15 @@ does not mean it will be implemented right away, or exactly as written.
 
 To implement an approved RFC:
 
-1. **Split the RFC into parts.** Each part can be implemented on its own,
-   for example the ontology, a new crate, or a change to a background
-   process.
+1. **Split the RFC into parts**, as its **From RFC to Discussion** section
+   describes. Each part can be implemented on its own, for example the
+   ontology, a new crate, or a change to a background process.
 2. **Open a discussion for each part**, in the
    [Issue category][discussions] of the Mosaico discussions. Link the RFC
-   and the section the part comes from, and describe how you plan to
+   and the sections the part comes from, and describe how you plan to
    implement it. The discussion checks that this way of implementing it is
-   reasonable.
+   reasonable. It also answers the questions of the part in the **Left to
+   the Implementation** section.
 3. **Follow the [contribution guidelines][contributing]** of the Mosaico
    repository from there: once the discussion is approved, one or more
    issues are opened, and each issue is solved by one or more pull
