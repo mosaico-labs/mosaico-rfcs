@@ -64,7 +64,9 @@ An RFC should be understandable by someone who does not know the code, and
 precise enough to be split into parts, each one becoming a discussion. It
 usually has these sections:
 
-- **Summary**: the change, in one paragraph.
+- **Summary**: a short description of what the change adds, why, and how
+  it works at a high level, so that a reader gets the idea without reading
+  the rest of the RFC.
 - **Motivation**: the problem it solves, and who is affected by it.
 - **Design**: how it works, across the parts of Mosaico it touches. Explain
   the new concepts, the data that changes (for example ontologies,
