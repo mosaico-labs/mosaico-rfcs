@@ -11,7 +11,8 @@ has its own serialization format:
   example, the images of a ROS bag.
 
 Their main goal is to replace the `Image` ontology, which becomes deprecated
-for the reasons explained in the Motivation. The `CompressedImage` ontology,
+for the reasons explained in the Motivation, and will be removed in a future
+release. The `CompressedImage` ontology,
 for lossy images and video streams, is not affected by these changes.
 
 The client uploads the images to `mosaicod` as they are. Later, the store
@@ -263,17 +264,34 @@ export it turns it back into the same message:
 | `encoding`, `is_bigendian` | `encoding`, `is_bigendian` |
 | `data` | `data` |
 
-An image whose stamp is zero has no capture time, so it is not translated
-(see the [open questions about ROS images][ros-open-questions]). The ROS
-bridge creates a topic only when its first message is translated, so a ROS
-topic whose images all have a zero stamp is not created at all, instead of
-being left empty.
+An image whose stamp is zero has no capture time, because its driver did
+not fill it, so it cannot become an `ImageSequenceRaw`. However, these
+images are ingested today as `Image`, which needs no capture time, and a bag
+that is ingested today must not fail after this change. For this reason,
+the ROS bridge chooses the ontology of each topic from its first image:
+
+- if its stamp is not zero, the topic is an `ImageSequenceRaw`
+- if its stamp is zero, the topic is an `Image`, as before this RFC, and the
+  bridge warns the user that the topic is stored with a deprecated ontology
+
+The choice holds for the whole topic, because the ontology of a topic is
+fixed when the topic is created. So a topic whose first image has a stamp,
+and a later one has none, stays an `ImageSequenceRaw`, and that later image
+is refused as the error policy of the topic says (see the [open questions
+about ROS images][ros-open-questions]).
+
+The user can also choose `Image` for a topic, whatever its stamps, through
+the adapter `ImageAdapter.using(Image)`, which is deprecated too.
 
 ### `Image` is deprecated
 
 `Image` topics can still be written and read, but creating one for writing
 warns the user to use `ImageSequenceRaw` instead. The `Image` topics already
 stored are still exported to ROS.
+
+`Image` will be removed in a future release. Until then, it is kept for the
+ROS images that have no capture time, as explained in [ROS
+images](#ros-images), and for the clients that still write it.
 
 ### The serialization formats
 
@@ -751,11 +769,19 @@ ways:
   queries can filter on all its fields except `data`.
 - **The deprecation of `Image`.** Creating an `Image` topic for writing
   raises a `DeprecationWarning`, which names `ImageSequenceRaw` as its
-  replacement. Reading an `Image` topic does not warn.
-- **The ROS bridge.** The `sensor_msgs/Image` adapter now translates a ROS
-  image into an `ImageSequenceRaw`, and back, as described in [ROS
-  images](#ros-images). The `Image` topics already stored are still
-  exported to ROS by a separate adapter, which keeps the old translation.
+  replacement and says that `Image` will be removed in a future release.
+  Reading an `Image` topic does not warn.
+- **The ROS bridge.** The `sensor_msgs/Image` adapter, `ImageAdapter`, now
+  translates a ROS image into an `ImageSequenceRaw` by default, and back.
+  A topic whose first image has no stamp is translated into an `Image`
+  instead, as described in [ROS images](#ros-images). To make this choice,
+  every adapter gets a hook, `adapter_for_topic`, which receives the first
+  message of a topic and returns the adapter of the whole topic. By
+  default, it returns the adapter itself.
+- **The old translation.** `ImageAdapter.using(Image)` returns the adapter
+  that keeps the old translation into `Image`, which also exports the `Image`
+  topics to ROS. It raises a `DeprecationWarning`, because it will be
+  removed together with `Image`.
 
 The SDK can read the images, but not the video yet (see [Reading
 back](#reading-back-1) in the open questions).
@@ -778,11 +804,15 @@ back](#reading-back-1) in the open questions).
   a time.
 - **Few players read the video.** FFmpeg and the tools built on it read FFV1
   in MP4 and DASH, but browsers do not.
-- **Some ROS images are refused.** A ROS image whose stamp is zero cannot be
-  translated. With the default error policy of a topic, `raise`, the
-  ingestion of the bag stops. With `ignore`, the image is dropped and the
-  others are ingested, while with `finalize` the rest of the topic is
-  dropped.
+- **Some ROS topics do not become videos.** A topic whose first image has
+  no stamp is stored as `Image`, so it stays as Parquet files. Besides,
+  `Image` will be removed, so these topics will need a capture time by
+  then.
+- **Some ROS images are refused.** In a topic whose first image has a
+  stamp, a later image without one cannot be translated. With the default
+  error policy of a topic, `raise`, the ingestion of the bag stops. With
+  `ignore`, the image is dropped and the others are ingested, while with
+  `finalize` the rest of the topic is dropped.
 
 ## Alternatives
 
@@ -1024,23 +1054,30 @@ they can stay open.
 
 ### ROS images
 
-- **Question:** A ROS image whose stamp is zero has no capture time, because
-  its driver did not fill it, and the time it was recorded in the bag is not
-  its capture time. The options are:
-  - refuse them, as now
-  - use the time they were recorded in the bag, which is simple, but the
-    capture time is then wrong and nothing tells it apart from a right one
+- **Question:** A topic whose first image has no stamp is stored as
+  `Image`, so it does not become a video, and it will need another solution
+  when `Image` is removed. The time each image was recorded in the bag is
+  not its capture time, so the options are:
+  - keep `Image` for these topics until it is removed, and refuse them
+    afterwards
+  - use the time each image was recorded in the bag as its capture time,
+    which is simple, but the capture time is then wrong, and nothing tells
+    it apart from a right one
   - make `capture_timestamp_ns` optional, but then the video can no longer
     order the frames, so the topic cannot become a video
 
-  What should we do with these images?
-  - **Proposal:** keep refusing them, as the error policy of the topic
-    says. With `raise`, the default, the ingestion stops, and the error
-    names the topic and explains how to ingest it. To ingest it, the user
-    turns on a new option of the ROS bridge for that topic, which uses the
-    time each image was recorded in the bag as its capture time. These
-    capture times are only approximate, so the topic marks them in its
-    metadata, and they can be told apart from real ones.
+  What should these topics become when `Image` is removed?
+  - **Proposal:** a new option of the ROS bridge, turned on for a topic,
+    uses the time each image was recorded in the bag as its capture time.
+    These capture times are only approximate, so the topic marks them in
+    its metadata, and they can be told apart from real ones.
+- **Question:** In a topic whose first image has a stamp, a later image
+  without one is refused, because the topic is already an
+  `ImageSequenceRaw`. Drivers usually fill the stamp of every image or of
+  none, so this case should be rare. Should these images be ingested
+  anyway?
+  - **Proposal:** not now. If users need it, the option above can also
+    give these images the time they were recorded in the bag.
 - **Question:** An `ImageSequence` cannot be exported to ROS. Should it?
   - **Proposal:** export it as a `CompressedImage` in PNG
 
@@ -1253,8 +1290,11 @@ images, like any other topic.
 ### 2. ROS images and the deprecation of `Image`
 
 The ROS bridge translates the ROS images into `ImageSequenceRaw`, and
-creates a topic only after its first translated image. Creating an `Image`
-topic for writing warns the user to use `ImageSequenceRaw` instead.
+creates a topic only after its first translated image. A topic whose first
+image has no stamp is translated into `Image` instead, so that the bags
+ingested today do not fail. Creating an `Image` topic for writing warns the
+user to use `ImageSequenceRaw` instead, because `Image` will be removed in a
+future release.
 
 - **Sections:** [ROS images](#ros-images),
   [`Image` is deprecated](#image-is-deprecated),
